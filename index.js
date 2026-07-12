@@ -1,7 +1,7 @@
 const { Telegraf } = require('telegraf');
 
 // Replace with your actual Bot Token from @BotFather
-const BOT_TOKEN = '8853776174:AAGoRVbmtP0rYZa9DmzMthYOAOd_osBbpQM'; 
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const bot = new Telegraf(BOT_TOKEN);
 
 // 1. The /start command (Shows the Mini App button)
