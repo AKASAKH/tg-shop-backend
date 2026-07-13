@@ -30,7 +30,6 @@ bot.start(async (ctx) => {
     const userId = ctx.message.from.id.toString();
     const username = ctx.message.from.username || 'No username';
 
-    // FIX: Changed 'new: true' to 'returnDocument: "after"' to fix the warning
     await User.findOneAndUpdate(
       { telegramId: userId },
       { telegramId: userId, username: username },
@@ -123,7 +122,8 @@ bot.catch((err, ctx) => {
   console.error(`Bot error:`, err);
 });
 
-bot.launch();
+// FIX FOR 409 CONFLICT: Drop pending updates to clear stuck Telegram sessions
+bot.launch({ dropPendingUpdates: true });
 console.log('✅ Bot is running...');
 
 // =====================
@@ -135,10 +135,11 @@ app.get('/', (req, res) => res.send('✅ TG Shop Backend is running!'));
 app.get('/health', (req, res) => res.json({ 
   status: 'ok', 
   bot: 'running',
+  db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   uptime: process.uptime()
 }));
 
-app.listen(port, '0.0.0.0', () => console.log(` Server running on port ${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`🚀 Server running on port ${port}`));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
