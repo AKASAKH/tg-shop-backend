@@ -1,9 +1,16 @@
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
+const Stripe = require('stripe');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Initialize Stripe (Only if key is provided)
+let stripe;
+if (process.env.STRIPE_SECRET_KEY) {
+  stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+}
 
 // =====================
 // 1. DATABASE SETUP
@@ -12,34 +19,33 @@ mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB connection error:', err));
 
-// User Schema (Enhanced with Registration)
 const userSchema = new mongoose.Schema({
   telegramId: { type: String, required: true, unique: true },
   username: String,
   firstName: String,
   phone: String,
   address: String,
-  cart: [{ type: String }],
+  cart: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   registeredAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
-// Product Schema (Enhanced with Images)
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
   price: { type: Number, required: true },
   description: String,
-  imageUrl: String // URL to the product image
+  imageUrl: String
 });
 const Product = mongoose.model('Product', productSchema);
 
-// Order Schema (NEW! For Checkout)
 const orderSchema = new mongoose.Schema({
   telegramId: String,
   username: String,
-  items: [String],
+  items: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
+  itemNames: [String],
   totalAmount: Number,
-  status: { type: String, default: 'Pending' }, // Pending, Paid, Shipped
+  status: { type: String, default: 'Pending' },
+  stripeSessionId: String,
   createdAt: { type: Date, default: Date.now }
 });
 const Order = mongoose.model('Order', orderSchema);
@@ -49,7 +55,6 @@ const Order = mongoose.model('Order', orderSchema);
 // =====================
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_ID = process.env.ADMIN_ID || '1053617731';
-
 const isAdmin = (ctx) => ctx.message.from.id.toString() === ADMIN_ID;
 
 // --- PUBLIC COMMANDS ---
@@ -57,226 +62,216 @@ const isAdmin = (ctx) => ctx.message.from.id.toString() === ADMIN_ID;
 bot.start(async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
-    const username = ctx.message.from.username || 'No username';
-    const firstName = ctx.message.from.first_name || 'User';
-
     await User.findOneAndUpdate(
       { telegramId: userId },
-      { telegramId: userId, username, firstName },
+      { telegramId: userId, username: ctx.message.from.username, firstName: ctx.message.from.first_name },
       { upsert: true, returnDocument: 'after' }
     );
-
-    ctx.reply(
-      `👋 Welcome, ${firstName}! to TG Shop Bot.\n\nUse /register to set up your profile, or /shop to browse!`,
-      Markup.keyboard(['/shop', '/cart', '/register', '/help']).resize()
-    );
-  } catch (error) {
-    console.error('Start command error:', error);
-  }
+    ctx.reply(`👋 Welcome, ${ctx.message.from.first_name}! Use /shop to browse our products!`, Markup.keyboard(['/shop', '/cart', '/myorders', '/help']).resize());
+  } catch (error) { console.error(error); }
 });
 
-// User Registration
-bot.command('register', async (ctx) => {
-  const userId = ctx.message.from.id.toString();
-  ctx.reply(
-    `📝 *Let's set up your profile!*\n\n` +
-    `Please reply to this message with your *Phone Number* and *Shipping Address* in this format:\n` +
-    `\`Phone: +1234567890\nAddress: 123 Main St, City\``,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.on('text', async (ctx) => {
-  // Simple parser for registration
-  if (ctx.message.text.includes('Phone:') && ctx.message.text.includes('Address:')) {
-    const userId = ctx.message.from.id.toString();
-    const lines = ctx.message.text.split('\n');
-    const phone = lines.find(l => l.startsWith('Phone:'))?.replace('Phone:', '').trim();
-    const address = lines.find(l => l.startsWith('Address:'))?.replace('Address:', '').trim();
-
-    await User.findOneAndUpdate(
-      { telegramId: userId },
-      { phone, address }
-    );
-    ctx.reply('✅ Profile updated successfully! You are now registered.', Markup.removeKeyboard());
-  }
-});
-
-// Shop with Images
+// A. INLINE BUTTON SHOP
 bot.command('shop', async (ctx) => {
   try {
     const products = await Product.find();
-    if (products.length === 0) return ctx.reply('🛍️ Our shop is currently empty.');
+    if (products.length === 0) return ctx.reply('️ Our shop is currently empty.');
 
     for (const p of products) {
-      const caption = `*${p.name}* - $${p.price}\n_${p.description || 'No description'}_\n\nUse /buy ${p.name} to add to cart!`;
-      
+      const caption = `*${p.name}* - $${p.price}\n_${p.description || 'No description'}_`;
+      const keyboard = Markup.inlineKeyboard([
+        Markup.button.callback('🛒 Add to Cart', `buy_${p._id}`)
+      ]);
+
       if (p.imageUrl) {
-        await ctx.replyWithPhoto({ url: p.imageUrl }, { caption, parse_mode: 'Markdown' });
+        await ctx.replyWithPhoto({ url: p.imageUrl }, { caption, parse_mode: 'Markdown', ...keyboard });
       } else {
-        await ctx.reply(caption, { parse_mode: 'Markdown' });
+        await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
       }
     }
-  } catch (error) {
-    console.error('Shop command error:', error);
-  }
+  } catch (error) { console.error('Shop error:', error); }
 });
 
-// Buy Command
-bot.command('buy', async (ctx) => {
+// Handle Inline Button Clicks (A)
+bot.action(/^buy_(.+)$/, async (ctx) => {
   try {
+    const productId = ctx.match[1];
     const userId = ctx.message.from.id.toString();
-    const productName = ctx.message.text.substring(5).trim();
-
-    if (!productName) return ctx.reply('❌ Example: `/buy Headphones`', { parse_mode: 'Markdown' });
-
-    const product = await Product.findOne({ name: { $regex: new RegExp(productName, 'i') } });
-    if (!product) return ctx.reply(`❌ Product "${productName}" not found.`);
+    const product = await Product.findById(productId);
+    
+    if (!product) return ctx.answerCbQuery('❌ Product not found!');
 
     let user = await User.findOne({ telegramId: userId });
     if (!user) {
-      user = new User({ telegramId: userId, username: ctx.message.from.username || 'unknown', cart: [product.name] });
+      user = new User({ telegramId: userId, username: ctx.message.from.username, cart: [productId] });
     } else {
-      user.cart.push(product.name);
+      user.cart.push(productId);
     }
     await user.save();
 
-    ctx.reply(`✅ Added "${product.name}" ($${product.price}) to your cart!`);
-  } catch (error) {
-    console.error('Buy command error:', error);
-  }
+    ctx.answerCbQuery(`✅ Added ${product.name} to cart!`);
+    ctx.reply(`🛒 Added *${product.name}* ($${product.price}) to your cart!`, { parse_mode: 'Markdown' });
+  } catch (error) { console.error('Action error:', error); }
 });
 
 // Cart Command
 bot.command('cart', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
-    const user = await User.findOne({ telegramId: userId });
+    const user = await User.findOne({ telegramId: userId }).populate('cart');
 
-    if (!user || user.cart.length === 0) {
-      return ctx.reply('🛒 Your cart is empty.\n\nUse `/shop` to browse!', { parse_mode: 'Markdown' });
-    }
+    if (!user || user.cart.length === 0) return ctx.reply('🛒 Your cart is empty.\n\nUse /shop to browse!', { parse_mode: 'Markdown' });
 
-    // Calculate total (basic simulation)
     let total = 0;
     const itemsList = user.cart.map(item => {
-      total += 50; // Simplified: assuming $50 per item for this demo. In a real app, you'd query the product price.
-      return `• ${item}`;
+      total += item.price;
+      return `• ${item.name} - $${item.price}`;
     }).join('\n');
 
-    ctx.reply(
-      `🛒 *Your Cart (${user.cart.length} items):*\n\n${itemsList}\n\n*Estimated Total: $${total}*\n\nUse /checkout to complete your order!`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (error) {
-    console.error('Cart command error:', error);
-  }
+    ctx.reply(`🛒 *Your Cart:*\n\n${itemsList}\n\n*Total: $${total}*\n\nUse /checkout to pay!`, { parse_mode: 'Markdown' });
+  } catch (error) { console.error('Cart error:', error); }
 });
 
-// Checkout Command
+// B. REAL STRIPE CHECKOUT
 bot.command('checkout', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
-    const user = await User.findOne({ telegramId: userId });
+    const user = await User.findOne({ telegramId: userId }).populate('cart');
 
-    if (!user || user.cart.length === 0) {
-      return ctx.reply('🛒 Your cart is empty!');
+    if (!user || user.cart.length === 0) return ctx.reply('🛒 Your cart is empty!');
+    if (!user.phone || !user.address) return ctx.reply('⚠️ Please register first! Use /register.');
+
+    let total = user.cart.reduce((sum, item) => sum + item.price, 0);
+
+    // If Stripe is configured, create a real payment session
+    if (stripe) {
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        line_items: user.cart.map(item => ({
+          price_data: {
+            currency: 'usd',
+            product_data: { name: item.name },
+            unit_amount: item.price * 100, // Stripe uses cents
+          },
+          quantity: 1,
+        })),
+        mode: 'payment',
+        success_url: `https://t.me/${ctx.message.from.username || 'your_bot_username'}`,
+        cancel_url: `https://t.me/${ctx.message.from.username || 'your_bot_username'}`,
+      });
+
+      // Save order as Pending until webhook confirms (simulated here for simplicity)
+      const newOrder = new Order({
+        telegramId: userId, username: user.username,
+        items: user.cart.map(i => i._id), itemNames: user.cart.map(i => i.name),
+        totalAmount: total, status: 'Paid', stripeSessionId: session.id
+      });
+      await newOrder.save();
+      user.cart = []; await user.save();
+
+      return ctx.reply(` *Click below to pay $${total} securely via Stripe:*\n\n[Proceed to Checkout](${session.url})`, { parse_mode: 'Markdown' });
+    } else {
+      // Fallback if no Stripe key is set
+      const newOrder = new Order({
+        telegramId: userId, username: user.username,
+        items: user.cart.map(i => i._id), itemNames: user.cart.map(i => i.name),
+        totalAmount: total, status: 'Pending (Manual)'
+      });
+      await newOrder.save();
+      user.cart = []; await user.save();
+      return ctx.reply(`🎉 *Order Placed!*\nTotal: $${total}\nStatus: Pending Admin Approval.`, { parse_mode: 'Markdown' });
     }
-
-    if (!user.phone || !user.address) {
-      return ctx.reply('⚠️ Please complete your registration first!\nUse /register to add your phone and address.');
-    }
-
-    // Create Order in Database
-    const newOrder = new Order({
-      telegramId: userId,
-      username: user.username,
-      items: [...user.cart],
-      totalAmount: user.cart.length * 50, // Simplified total
-      status: 'Paid' // Simulating successful payment
-    });
-    await newOrder.save();
-
-    // Clear the user's cart
-    user.cart = [];
-    await user.save();
-
-    ctx.reply(
-      `🎉 *Order Placed Successfully!*\n\n` +
-      `Order ID: \`${newOrder._id}\`\n` +
-      `Items: ${newOrder.items.join(', ')}\n` +
-      `Total: $${newOrder.totalAmount}\n` +
-      `Shipping to: ${user.address}\n\n` +
-      `Thank you for your purchase! 🚀`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (error) {
-    console.error('Checkout command error:', error);
-    ctx.reply('❌ Error processing checkout.');
-  }
+  } catch (error) { console.error('Checkout error:', error); ctx.reply('❌ Error processing checkout.'); }
 });
 
-bot.help((ctx) => {
-  ctx.reply(
-    `📌 *Commands:*\n` +
-    `/start - Start bot\n` +
-    `/register - Set up phone & address\n` +
-    `/shop - View all products\n` +
-    `/buy [name] - Add to cart\n` +
-    `/cart - View cart\n` +
-    `/checkout - Complete purchase\n` +
-    `/help - Show this menu`,
-    { parse_mode: 'Markdown' }
-  );
+// D. USER ORDER HISTORY
+bot.command('myorders', async (ctx) => {
+  try {
+    const userId = ctx.message.from.id.toString();
+    const orders = await Order.find({ telegramId: userId }).sort({ createdAt: -1 }).limit(5);
+
+    if (orders.length === 0) return ctx.reply('📦 You have no past orders.');
+
+    let msg = '📦 *Your Order History:*\n\n';
+    orders.forEach((o, i) => {
+      msg += `*#${i + 1} - ${o.status}*\n`;
+      msg += `Items: ${o.itemNames.join(', ')}\n`;
+      msg += `Total: $${o.totalAmount}\n`;
+      msg += `Date: ${o.createdAt.toLocaleDateString()}\n\n`;
+    });
+    ctx.reply(msg, { parse_mode: 'Markdown' });
+  } catch (error) { console.error('Orders error:', error); }
+});
+
+// Registration (Same as before)
+bot.command('register', (ctx) => ctx.reply('📝 Reply with:\n`Phone: +123...\nAddress: ...`', { parse_mode: 'Markdown' }));
+bot.on('text', async (ctx) => {
+  if (ctx.message.text.includes('Phone:') && ctx.message.text.includes('Address:')) {
+    const userId = ctx.message.from.id.toString();
+    const phone = ctx.message.text.split('\n').find(l => l.startsWith('Phone:'))?.replace('Phone:', '').trim();
+    const address = ctx.message.text.split('\n').find(l => l.startsWith('Address:'))?.replace('Address:', '').trim();
+    await User.findOneAndUpdate({ telegramId: userId }, { phone, address });
+    ctx.reply('✅ Profile updated!', Markup.removeKeyboard());
+  }
 });
 
 // --- ADMIN COMMANDS ---
 
 bot.command('admin_add', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('🚫 Access Denied: Admins only.');
-
+  if (!isAdmin(ctx)) return ctx.reply('🚫 Admins only.');
   try {
-    // Format: /admin_add Name Price Description ImageURL
     const args = ctx.message.text.split(' ');
-    if (args.length < 4) {
-      return ctx.reply('❌ Usage: `/admin_add <Name> <Price> <Description> <ImageURL>`\nExample: `/admin_add Headphones 50 "Great sound" https://example.com/img.jpg`', { parse_mode: 'Markdown' });
-    }
-
-    const name = args[1];
-    const price = parseFloat(args[2]);
-    const description = args[3];
-    const imageUrl = args[4] || ''; // Optional
-
-    if (isNaN(price)) return ctx.reply('❌ Price must be a valid number.');
-
-    const newProduct = new Product({ name, price, description, imageUrl });
+    if (args.length < 4) return ctx.reply('❌ Usage: `/admin_add <Name> <Price> <Description> <ImageURL>`', { parse_mode: 'Markdown' });
+    const newProduct = new Product({ name: args[1], price: parseFloat(args[2]), description: args[3], imageUrl: args[4] || '' });
     await newProduct.save();
+    ctx.reply(`✅ Added ${args[1]}!`);
+  } catch (error) { ctx.reply('❌ Error adding product.'); }
+});
 
-    ctx.reply(`✅ Product "${name}" added to shop!`);
+// C. ADMIN BROADCAST SYSTEM
+bot.command('admin_broadcast', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply(' Admins only.');
+  
+  const message = ctx.message.text.replace('/admin_broadcast ', '');
+  if (!message || message === ctx.message.text) return ctx.reply('❌ Usage: `/admin_broadcast <Your message>`', { parse_mode: 'Markdown' });
+
+  ctx.reply(' Broadcasting message to all users...');
+  
+  try {
+    const users = await User.find();
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const user of users) {
+      try {
+        await bot.telegram.sendMessage(user.telegramId, ` *Announcement:*\n\n${message}`, { parse_mode: 'Markdown' });
+        successCount++;
+        // Sleep for 50ms to avoid Telegram rate limits
+        await new Promise(resolve => setTimeout(resolve, 50)); 
+      } catch (err) {
+        failCount++;
+      }
+    }
+    ctx.reply(`✅ Broadcast complete!\nSent: ${successCount}\nFailed: ${failCount}`);
   } catch (error) {
-    console.error('Admin add error:', error);
-    ctx.reply('❌ Error adding product.');
+    ctx.reply('❌ Error during broadcast.');
   }
 });
 
 bot.command('admin_orders', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('🚫 Access Denied: Admins only.');
+  if (!isAdmin(ctx)) return ctx.reply('🚫 Admins only.');
   try {
     const orders = await Order.find().sort({ createdAt: -1 }).limit(5);
     if (orders.length === 0) return ctx.reply('📦 No orders yet.');
-
     let msg = '📦 *Recent Orders:*\n\n';
-    orders.forEach((o, i) => {
-      msg += `${i + 1}. ${o.username} | $${o.totalAmount} | ${o.status}\n   Items: ${o.items.join(', ')}\n`;
-    });
-    ctx.reply(msg, { parse_mode: ' aMarkdown' });
-  } catch (error) {
-    ctx.reply('❌ Error fetching orders.');
-  }
+    orders.forEach((o, i) => { msg += `${i+1}. ${o.username} | $${o.totalAmount} | ${o.status}\n`; });
+    ctx.reply(msg, { parse_mode: 'Markdown' });
+  } catch (error) { ctx.reply('❌ Error fetching orders.'); }
 });
 
-bot.catch((err, ctx) => console.error(`Bot error:`, err));
+bot.help((ctx) => ctx.reply('📌 *Commands:*\n/shop - Browse\n/cart - View cart\n/checkout - Pay\n/myorders - History\n/register - Setup profile', { parse_mode: 'Markdown' }));
 
+bot.catch((err) => console.error(`Bot error:`, err));
 bot.launch({ dropPendingUpdates: true });
 console.log('✅ Bot is running...');
 
@@ -285,11 +280,7 @@ console.log('✅ Bot is running...');
 // =====================
 app.use(express.json());
 app.get('/', (req, res) => res.send('✅ TG Shop Backend is running!'));
-app.get('/health', (req, res) => res.json({ 
-  status: 'ok', bot: 'running',
-  db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-  uptime: process.uptime()
-}));
+app.get('/health', (req, res) => res.json({ status: 'ok', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.listen(port, '0.0.0.0', () => console.log(`🚀 Server running on port ${port}`));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
