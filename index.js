@@ -30,10 +30,11 @@ bot.start(async (ctx) => {
     const userId = ctx.message.from.id.toString();
     const username = ctx.message.from.username || 'No username';
 
+    // FIX: Changed 'new: true' to 'returnDocument: "after"' to fix the warning
     await User.findOneAndUpdate(
       { telegramId: userId },
       { telegramId: userId, username: username },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' } 
     );
 
     ctx.reply(
@@ -56,28 +57,19 @@ bot.command('shop', (ctx) => {
   );
 });
 
-// =====================
-// IMPROVED /add COMMAND
-// =====================
 bot.command('add', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
-    
-    // Get the text after /add
     const text = ctx.message.text.trim();
-    const item = text.substring(5).trim(); // Remove '/add ' from the text
-    
-    console.log(`User ${userId} trying to add: "${item}"`);
+    const item = text.substring(5).trim(); 
     
     if (!item || item.length === 0) {
       return ctx.reply('❌ Please specify an item.\n\nExample: `/add Headphones`', { parse_mode: 'Markdown' });
     }
 
-    // Find or create user, then add to cart
     let user = await User.findOne({ telegramId: userId });
     
     if (!user) {
-      // Create new user if doesn't exist
       user = new User({
         telegramId: userId,
         username: ctx.message.from.username || 'unknown',
@@ -85,7 +77,6 @@ bot.command('add', async (ctx) => {
       });
       await user.save();
     } else {
-      // Add item to existing cart
       user.cart.push(item);
       await user.save();
     }
@@ -98,9 +89,6 @@ bot.command('add', async (ctx) => {
   }
 });
 
-// =====================
-// /cart COMMAND
-// =====================
 bot.command('cart', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
