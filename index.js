@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors'); // Added for Mini App connection
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const Stripe = require('stripe');
@@ -67,8 +68,47 @@ bot.start(async (ctx) => {
       { telegramId: userId, username: ctx.message.from.username, firstName: ctx.message.from.first_name },
       { upsert: true, returnDocument: 'after' }
     );
-    ctx.reply(`👋 Welcome, ${ctx.message.from.first_name}! Use /shop to browse our products!`, Markup.keyboard(['/shop', '/cart', '/myorders', '/help']).resize());
+    
+    // Added Web App Button to the start message
+    ctx.reply(`👋 Welcome, ${ctx.message.from.first_name}! Use /shop to browse our products!`, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🛍️ Open Visual Shop', web_app: { url: 'https://akasakh.github.io/tg-shop-miniapp/' } }
+        ]],
+        keyboard: [['/shop', '/cart', '/myorders', '/help']],
+        resize_keyboard: true
+      }
+    });
   } catch (error) { console.error(error); }
+});
+
+// Handle Mini App Checkout Data (Saves to MongoDB)
+bot.on('web_app_data', async (ctx) => {
+  try {
+    const data = JSON.parse(ctx.message.web_app_data.data);
+    
+    if (data.action === 'checkout') {
+      // 1. Save Order to Database
+      const newOrder = new Order({
+        telegramId: data.user.id.toString(),
+        username: data.user.username,
+        items: data.items.map(i => i.id), 
+        itemNames: data.items.map(i => i.name),
+        totalAmount: data.total,
+        status: 'Paid (Mini App)',
+        createdAt: new Date()
+      });
+      await newOrder.save();
+
+      // 2. Notify User
+      await ctx.reply(`✅ Order received via Mini App!\nTotal: $${data.total}\nWe will contact you shortly.`);
+
+      // 3. Notify Admin
+      await bot.telegram.sendMessage(ADMIN_ID, `🚨 NEW MINI APP ORDER\nUser: @${data.user.username || data.user.id}\nTotal: $${data.total}`);
+    }
+  } catch (error) {
+    console.error('Web app data error:', error);
+  }
 });
 
 // A. INLINE BUTTON SHOP
@@ -92,7 +132,6 @@ bot.command('shop', async (ctx) => {
   } catch (error) { console.error('Shop error:', error); }
 });
 
-// Handle Inline Button Clicks (A)
 bot.action(/^buy_(.+)$/, async (ctx) => {
   try {
     const productId = ctx.match[1];
@@ -114,7 +153,6 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
   } catch (error) { console.error('Action error:', error); }
 });
 
-// Cart Command
 bot.command('cart', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
@@ -132,7 +170,6 @@ bot.command('cart', async (ctx) => {
   } catch (error) { console.error('Cart error:', error); }
 });
 
-// B. REAL STRIPE CHECKOUT
 bot.command('checkout', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
@@ -143,7 +180,6 @@ bot.command('checkout', async (ctx) => {
 
     let total = user.cart.reduce((sum, item) => sum + item.price, 0);
 
-    // If Stripe is configured, create a real payment session
     if (stripe) {
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ['card'],
@@ -151,7 +187,7 @@ bot.command('checkout', async (ctx) => {
           price_data: {
             currency: 'usd',
             product_data: { name: item.name },
-            unit_amount: item.price * 100, // Stripe uses cents
+            unit_amount: item.price * 100,
           },
           quantity: 1,
         })),
@@ -160,7 +196,6 @@ bot.command('checkout', async (ctx) => {
         cancel_url: `https://t.me/${ctx.message.from.username || 'your_bot_username'}`,
       });
 
-      // Save order as Pending until webhook confirms (simulated here for simplicity)
       const newOrder = new Order({
         telegramId: userId, username: user.username,
         items: user.cart.map(i => i._id), itemNames: user.cart.map(i => i.name),
@@ -171,7 +206,6 @@ bot.command('checkout', async (ctx) => {
 
       return ctx.reply(` *Click below to pay $${total} securely via Stripe:*\n\n[Proceed to Checkout](${session.url})`, { parse_mode: 'Markdown' });
     } else {
-      // Fallback if no Stripe key is set
       const newOrder = new Order({
         telegramId: userId, username: user.username,
         items: user.cart.map(i => i._id), itemNames: user.cart.map(i => i.name),
@@ -184,7 +218,6 @@ bot.command('checkout', async (ctx) => {
   } catch (error) { console.error('Checkout error:', error); ctx.reply('❌ Error processing checkout.'); }
 });
 
-// D. USER ORDER HISTORY
 bot.command('myorders', async (ctx) => {
   try {
     const userId = ctx.message.from.id.toString();
@@ -203,7 +236,6 @@ bot.command('myorders', async (ctx) => {
   } catch (error) { console.error('Orders error:', error); }
 });
 
-// Registration (Same as before)
 bot.command('register', (ctx) => ctx.reply('📝 Reply with:\n`Phone: +123...\nAddress: ...`', { parse_mode: 'Markdown' }));
 bot.on('text', async (ctx) => {
   if (ctx.message.text.includes('Phone:') && ctx.message.text.includes('Address:')) {
@@ -228,7 +260,6 @@ bot.command('admin_add', async (ctx) => {
   } catch (error) { ctx.reply('❌ Error adding product.'); }
 });
 
-// C. ADMIN BROADCAST SYSTEM
 bot.command('admin_broadcast', async (ctx) => {
   if (!isAdmin(ctx)) return ctx.reply(' Admins only.');
   
@@ -246,7 +277,6 @@ bot.command('admin_broadcast', async (ctx) => {
       try {
         await bot.telegram.sendMessage(user.telegramId, ` *Announcement:*\n\n${message}`, { parse_mode: 'Markdown' });
         successCount++;
-        // Sleep for 50ms to avoid Telegram rate limits
         await new Promise(resolve => setTimeout(resolve, 50)); 
       } catch (err) {
         failCount++;
@@ -276,9 +306,27 @@ bot.launch({ dropPendingUpdates: true });
 console.log('✅ Bot is running...');
 
 // =====================
-// 3. EXPRESS SERVER
+// 3. EXPRESS SERVER & API
 // =====================
+app.use(cors()); // Allows GitHub Pages to access this API
 app.use(express.json());
+
+// NEW: API Endpoint for the Mini App to fetch products
+app.get('/api/products', async (req, res) => {
+    try {
+        const products = await Product.find();
+        res.json(products.map(p => ({
+            id: p._id.toString(),
+            name: p.name,
+            price: p.price,
+            description: p.description,
+            imageUrl: p.imageUrl
+        })));
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch products' });
+    }
+});
+
 app.get('/', (req, res) => res.send('✅ TG Shop Backend is running!'));
 app.get('/health', (req, res) => res.json({ status: 'ok', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.listen(port, '0.0.0.0', () => console.log(`🚀 Server running on port ${port}`));
