@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>TG Shop</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --bg: var(--tg-theme-bg-color, #ffffff);
+            --text: var(--tg-theme-text-color, #000000);
+            --hint: var(--tg-theme-hint-color, #999999);
+            --link: var(--tg-theme-link-color, #2481cc);
+            --btn: var(--tg-theme-button-color, #2481cc);
+            --btn-text: var(--tg-theme-button-text-color, #ffffff);
+            --secondary-bg: var(--tg-theme-secondary-bg-color, #f0f0f0);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            padding-bottom: 80px;
+        }
+
+        header {
+            padding: 16px;
+            text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+            border-bottom: 1px solid var(--secondary-bg);
+            position: sticky;
+            top: 0;
+            background: var(--bg);
+            z-index: 10;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--hint);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            padding: 16px;
+        }
+
+        .product-card {
+            background: var(--secondary-bg);
+            border-radius: 12px;
+            padding: 12px;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .product-image {
+            width: 100%;
+            height: 120px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            background-color: var(--bg);
+        }
+
+        .product-emoji-fallback {
+            width: 100%;
+            height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 48px;
+            background-color: var(--bg);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+
+        .product-name {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 4px;
+            line-height: 1.2;
+        }
+
+        .product-desc {
+            font-size: 11px;
+            color: var(--hint);
+            margin-bottom: 8px;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .product-price {
+            font-size: 16px;
+            font-weight: bold;
+            color: var(--link);
+            margin-bottom: 8px;
+        }
+
+        .add-btn {
+            background: var(--btn);
+            color: var(--btn-text);
+            border: none;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+        }
+        .add-btn:active { opacity: 0.8; }
+    </style>
+</head>
+<body>
+
+    <header>🛍️ Telegram Shop</header>
+
+    <div id="loadingState" class="loading">Loading products...</div>
+    <div class="products-grid" id="productsGrid" style="display: none;"></div>
+
+    <script>
+        // ==========================================
+        // ⚠️ CHANGE THIS TO YOUR ACTUAL RENDER URL! ⚠️
+        // ==========================================
+        const API_URL = https://tg-shop-backend.onrender.com; 
+
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        let products = [];
+        let cart = [];
+
+        // 1. Fetch Real Products from Database
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/api/products`);
+                if (!response.ok) throw new Error('Network response was not ok');
+                products = await response.json();
+                
+                document.getElementById('loadingState').style.display = 'none';
+                document.getElementById('productsGrid').style.display = 'grid';
+                renderProducts();
+            } catch (error) {
+                console.error('Failed to load products:', error);
+                document.getElementById('loadingState').innerHTML = `
+                    ❌ Failed to load shop.<br>
+                    <small>Make sure your Render backend is awake!</small><br><br>
+                    <button onclick="loadProducts()" style="padding:10px; border-radius:8px; border:none; background:var(--btn); color:var(--btn-text);">Retry</button>
+                `;
+            }
+        }
+
+        // 2. Render Products to Screen
+        function renderProducts() {
+            const grid = document.getElementById('productsGrid');
+            grid.innerHTML = products.map(p => {
+                // Use image if available, otherwise use a shopping bag emoji
+                const imageHtml = p.imageUrl 
+                    ? `<img src="${p.imageUrl}" class="product-image" alt="${p.name}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                       <div class="product-emoji-fallback" style="display:none;">🛍️</div>`
+                    : `<div class="product-emoji-fallback">🛍️</div>`;
+
+                return `
+                    <div class="product-card">
+                        ${imageHtml}
+                        <div class="product-name">${p.name}</div>
+                        <div class="product-desc">${p.description || ''}</div>
+                        <div class="product-price">$${parseFloat(p.price).toFixed(2)}</div>
+                        <button class="add-btn" onclick="addToCart('${p.id}')">Add to Cart</button>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // 3. Cart Logic
+        function addToCart(productId) {
+            const product = products.find(p => p.id === productId);
+            const existingItem = cart.find(item => item.id === productId);
+
+            if (existingItem) {
+                existingItem.qty += 1;
+            } else {
+                cart.push({ id: product.id, name: product.name, price: product.price, qty: 1 });
+            }
+
+            tg.HapticFeedback.impactOccurred('light');
+            updateCheckoutButton();
+        }
+
+        function getTotal() {
+            return cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+        }
+
+        function getTotalItems() {
+            return cart.reduce((sum, item) => sum + item.qty, 0);
+        }
+
+        // 4. Telegram Main Button (Checkout)
+        function updateCheckoutButton() {
+            const totalItems = getTotalItems();
+            const total = getTotal();
+
+            if (totalItems > 0) {
+                tg.MainButton.setText(`Checkout • $${total.toFixed(2)} (${totalItems} items)`);
+                tg.MainButton.show();
+            } else {
+                tg.MainButton.hide();
+            }
+        }
+
+        // 5. Handle Checkout Click
+        tg.MainButton.onClick(() => {
+            if (cart.length === 0) return;
+
+            // Prepare payload exactly as the backend expects it
+            const orderData = {
+                action: "checkout",
+                user: {
+                    id: tg.initDataUnsafe.user?.id,
+                    username: tg.initDataUnsafe.user?.username,
+                    first_name: tg.initDataUnsafe.user?.first_name
+                },
+                items: cart,
+                total: getTotal()
+            };
+
+            tg.HapticFeedback.notificationOccurred('success');
+            tg.sendData(JSON.stringify(orderData));
+            
+            tg.MainButton.showProgress(true);
+            tg.MainButton.setText('Processing Order...');
+        });
+
+        // Initialize App
+        loadProducts();
+    </script>
+</body>
+</html>
